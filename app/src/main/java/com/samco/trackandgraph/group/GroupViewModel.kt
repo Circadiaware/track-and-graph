@@ -15,7 +15,7 @@
  *  along with Track & Graph.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-@file:OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
+@file:OptIn(ExperimentalCoroutinesApi::class)
 
 package com.samco.trackandgraph.group
 
@@ -28,6 +28,7 @@ import com.samco.trackandgraph.base.model.di.MainDispatcher
 import com.samco.trackandgraph.graphstatproviders.GraphStatInteractorProvider
 import com.samco.trackandgraph.graphstatview.factories.viewdto.IGraphStatViewData
 import com.samco.trackandgraph.util.Stopwatch
+import com.samco.trackandgraph.util.flatMapLatestScan
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -59,41 +60,100 @@ class GroupViewModel @Inject constructor(
 
     private val groupId = MutableSharedFlow<Long>(1, 1)
 
-    val groupChildren: LiveData<List<GroupChild>> = groupId
-        .distinctUntilChanged()
-        .flatMapLatest { groupId ->
-            dataInteractor.getDataUpdateEvents()
-                .onStart { emit(Unit) }
-                .debounce(100)
-                .flatMapLatest { getGroupChildrenForGroupId(groupId) }
-        }
-        .flowOn(ui)
-        .asLiveData(viewModelScope.coroutineContext)
+    private val onUpdateChildrenForGroup = dataInteractor.getDataUpdateEvents()
+        .onStart { emit(Unit) }
+        .flatMapLatest { groupId }
 
-    private fun getGroupChildrenForGroupId(groupId: Long) = flow {
-        //Start getting the trackers and groups
-        val trackerDataDeferred = getTrackerChildrenAsync(groupId)
-        val groupDataDeferred = getGroupChildrenAsync(groupId)
-        //Then get the graphs
-        getGraphViewData(groupId).collect { graphDataPairs ->
-            val trackerData = trackerDataDeferred.await()
-            val groupData = groupDataDeferred.await()
-            val graphData = graphsToGroupChildren(graphDataPairs)
-            val children = mutableListOf<GroupChild>().apply {
-                addAll(trackerData)
-                addAll(groupData)
-                addAll(graphData)
-            }
-            sortChildren(children)
-            val next = children.toList()
-            emit(next)
+    private val graphChildren = onUpdateChildrenForGroup
+        .distinctUntilChanged()
+        .map { getGraphObjects(it) }
+        .flatMapLatestScan(emptyList<GraphWithViewData>()) { old, new ->
+            getGraphViewDataForUpdatedGraphs(old, new)
         }
+        .map { graphsToGroupChildren(it) }
+        .flowOn(io)
+
+    private fun GraphOrStat.asLoading() = GraphWithViewData(
+        this,
+        CalculatedGraphViewData(
+            System.nanoTime(),
+            IGraphStatViewData.loading(this)
+        )
+    )
+
+    private suspend fun getGraphViewDataForUpdatedGraphs(
+        oldGraphs: List<GraphWithViewData>,
+        newGraphs: List<GraphOrStat>
+    ): Flow<List<GraphWithViewData>> = flow {
+        val stopwatch = Stopwatch().apply { start() }
+        val oldGraphsById = oldGraphs.associateBy { it.graph.id }
+
+        val pendingUpdates = mutableListOf<GraphWithViewData>()
+        val dontUpdate = mutableListOf<GraphWithViewData>()
+
+        for (config in newGraphs) {
+            //We don't need to update the view data if the graph hasn't changed
+            //display index updates only affect the order of the graphs not the data
+            if (oldGraphsById.containsKey(config.id) ||
+                oldGraphsById[config.id]?.graph?.copy(displayIndex = 0) != config.copy(displayIndex = 0)
+            ) {
+                pendingUpdates.add(config.asLoading())
+            } else {
+                dontUpdate.add(oldGraphsById[config.id]!!)
+            }
+        }
+
+        emit(dontUpdate + pendingUpdates)
+
+        val batch = mutableListOf<Deferred<GraphWithViewData>>()
+        for (pendingUpdate in pendingUpdates) {
+            val graph = pendingUpdate.graph
+            val viewData = viewModelScope.async(defaultDispatcher) {
+                val calculatedData = gsiProvider.getDataFactory(graph.type).getViewData(graph)
+                GraphWithViewData(
+                    graph,
+                    //Shouldn't really need to add one here but it just forces the times to be different
+                    // There was a bug previously where the loading and ready states had the same time using
+                    // Instant.now() which caused ready states to be missed and infinite loading to be shown
+                    CalculatedGraphViewData(System.nanoTime() + 1, calculatedData)
+                )
+            }
+            batch.add(viewData)
+        }
+
+        val updated = batch.awaitAll()
+
+        emit(dontUpdate + updated)
+
+        stopwatch.stop()
+        Timber.i("Took ${stopwatch.elapsedMillis}ms to generate view data for ${newGraphs.size} graph(s)")
     }
 
+    private val trackersChildren = onUpdateChildrenForGroup
+        .distinctUntilChanged()
+        .map { getTrackerChildrenAsync(it) }
+        .flowOn(io)
+
+    private val groupChildren = onUpdateChildrenForGroup
+        .distinctUntilChanged()
+        .map { getGroupChildrenAsync(it) }
+        .flowOn(io)
+
+    val allChildren: LiveData<List<GroupChild>> =
+        combine(graphChildren, trackersChildren, groupChildren) { graphs, trackers, groups ->
+            val children = mutableListOf<GroupChild>().apply {
+                addAll(graphs)
+                addAll(trackers)
+                addAll(groups)
+            }
+            sortChildren(children)
+            return@combine children
+        }.flowOn(io).asLiveData(viewModelScope.coroutineContext)
+
     val trackers
-        get() = groupChildren.value
-            ?.filter { it.type == GroupChildType.TRACKER }
-            ?.map { it.obj as DisplayTracker }
+        get() = allChildren.value
+            ?.filterIsInstance<GroupChild.ChildTracker>()
+            ?.map { it.displayTracker }
             ?: emptyList()
 
     fun setGroup(groupId: Long) {
@@ -118,53 +178,26 @@ class GroupViewModel @Inject constructor(
         }
     }
 
-    private fun getTrackerChildrenAsync(groupId: Long) = viewModelScope.async(io) {
-        return@async dataInteractor.getDisplayTrackersForGroupSync(groupId).map {
-            GroupChild(GroupChildType.TRACKER, it, it.id, it.displayIndex)
+    private suspend fun getTrackerChildrenAsync(groupId: Long): List<GroupChild> {
+        return dataInteractor.getDisplayTrackersForGroupSync(groupId).map {
+            GroupChild.ChildTracker(it.id, it.displayIndex, it)
         }
     }
 
-    private fun getGroupChildrenAsync(groupId: Long) = viewModelScope.async(io) {
-        return@async dataInteractor.getGroupsForGroupSync(groupId).map {
-            GroupChild(GroupChildType.GROUP, it, it.id, it.displayIndex)
+    private suspend fun getGroupChildrenAsync(groupId: Long): List<GroupChild> {
+        return dataInteractor.getGroupsForGroupSync(groupId).map {
+            GroupChild.ChildGroup(it.id, it.displayIndex, it)
         }
     }
 
-    private suspend fun getGraphViewData(groupId: Long) =
-        flow<List<Pair<Long, IGraphStatViewData>>> {
-            val stopwatch = Stopwatch().apply { start() }
-            val graphStats = dataInteractor.getGraphsAndStatsByGroupIdSync(groupId)
-            graphStats.forEach {
-                gsiProvider.getDataSourceAdapter(it.type).preen(it)
-            }
-            val loadingStates =
-                graphStats.map { Pair(System.nanoTime(), IGraphStatViewData.loading(it)) }
-            emit(loadingStates)
+    private suspend fun getGraphObjects(groupId: Long): List<GraphOrStat> {
+        val graphStats = dataInteractor.getGraphsAndStatsByGroupIdSync(groupId)
+        return graphStats.filter { !gsiProvider.getDataSourceAdapter(it.type).preen(it) }
+    }
 
-            val batch = mutableListOf<Deferred<IGraphStatViewData>>()
-            for (index in graphStats.indices) {
-                val graphOrStat = graphStats[index]
-                val viewData = viewModelScope.async(defaultDispatcher) {
-                    gsiProvider.getDataFactory(graphOrStat.type).getViewData(graphOrStat)
-                }
-                batch.add(index, viewData)
-            }
-            //Shouldn't really need to add one here but it just forces the times to be different
-            // There was a bug previously where the loading and ready states had the same time using
-            // Instant.now() which caused ready states to be missed and infinite loading to be shown
-            emit(batch.map { Pair(System.nanoTime() + 1, it.await()) })
-            stopwatch.stop()
-            Timber.i("Took ${stopwatch.elapsedMillis}ms to generate view data for ${graphStats.size} graph(s)")
-        }.flowOn(io)
-
-    private fun graphsToGroupChildren(graphs: List<Pair<Long, IGraphStatViewData>>): List<GroupChild> {
+    private fun graphsToGroupChildren(graphs: List<GraphWithViewData>): List<GroupChild> {
         return graphs.map {
-            GroupChild(
-                GroupChildType.GRAPH,
-                it,
-                it.second.graphOrStat.id,
-                it.second.graphOrStat.displayIndex
-            )
+            GroupChild.ChildGraph(it.graph.id, it.graph.displayIndex, it.viewData)
         }
     }
 
@@ -184,7 +217,9 @@ class GroupViewModel @Inject constructor(
     }
 
     fun adjustDisplayIndexes(items: List<GroupChild>) = viewModelScope.launch(io) {
-        groupId.take(1).collect { dataInteractor.updateGroupChildOrder(it, items) }
+        groupId.take(1).collect {
+            dataInteractor.updateGroupChildOrder(it, items.map(GroupChild::toDto))
+        }
     }
 
     fun onDeleteGraphStat(id: Long) =
